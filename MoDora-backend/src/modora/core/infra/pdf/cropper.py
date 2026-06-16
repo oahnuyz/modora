@@ -14,8 +14,7 @@ from modora.core.interfaces.media import ImageProvider
 from modora.core.settings import Settings
 from modora.core.utils.paths import resolve_paths
 
-# If cropping fails (PDF cannot be opened / page number out of bounds / illegal bbox, etc.), return base64 of 1x1 blank PNG.
-_BLANK_1X1_PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMBAFh4kXcAAAAASUVORK5CYII="
+MIN_LLM_IMAGE_SIDE = 16
 
 
 def _normalize_pdf_path(pdf_path: str) -> str:
@@ -33,6 +32,23 @@ def _image_to_base64(img: Image.Image) -> str:
     return base64.b64encode(buffered.read()).decode("utf-8")
 
 
+def _ensure_min_image_size(img: Image.Image) -> Image.Image:
+    img = img.convert("RGB")
+    width = max(int(img.width), MIN_LLM_IMAGE_SIDE)
+    height = max(int(img.height), MIN_LLM_IMAGE_SIDE)
+    if width == img.width and height == img.height:
+        return img
+
+    canvas = Image.new("RGB", (width, height), "white")
+    canvas.paste(img, ((width - img.width) // 2, (height - img.height) // 2))
+    return canvas
+
+
+def _blank_image_base64() -> str:
+    img = Image.new("RGB", (MIN_LLM_IMAGE_SIDE, MIN_LLM_IMAGE_SIDE), "white")
+    return _image_to_base64(img)
+
+
 def _base64_to_image(data: str) -> Image.Image | None:
     try:
         raw = base64.b64decode(data)
@@ -45,7 +61,7 @@ def _base64_to_image(data: str) -> Image.Image | None:
 def _merge_images_to_base64(images: list[Image.Image | None]) -> str:
     valid = [img for img in images if img is not None]
     if not valid:
-        return _BLANK_1X1_PNG_BASE64
+        return _blank_image_base64()
 
     total_width = max(int(img.width) for img in valid)
     total_height = sum(int(img.height) for img in valid)
@@ -60,6 +76,7 @@ def _merge_images_to_base64(images: list[Image.Image | None]) -> str:
     if merged_image.width > MAX_SIZE or merged_image.height > MAX_SIZE:
         merged_image.thumbnail((MAX_SIZE, MAX_SIZE), Image.Resampling.LANCZOS)
 
+    merged_image = _ensure_min_image_size(merged_image)
     return _image_to_base64(merged_image)
 
 
@@ -408,7 +425,7 @@ class PDFCropper(ImageProvider):
         try:
             doc = fitz.open(source)
         except Exception:
-            return _BLANK_1X1_PNG_BASE64
+            return _blank_image_base64()
 
         # Create full-page bboxes for each page
         bbox_data = []

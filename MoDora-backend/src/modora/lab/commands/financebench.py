@@ -172,6 +172,23 @@ def register(sub: argparse._SubParsersAction) -> None:
     qa.add_argument("--debug", action="store_true", help="Store generated prompts")
     qa.set_defaults(_handler=_handle_financebench_qa)
 
+    qa_multi = sub.add_parser(
+        "financebench-qa-multidoc",
+        help=(
+            "Run FinanceBench QA against one merged multi-document tree with "
+            "MoDora semantic retrieval and OpenViking prompts"
+        ),
+    )
+    qa_multi.add_argument("--dataset", required=True, help="MoDora FinanceBench test.json")
+    qa_multi.add_argument("--cache", required=True, help="Cache directory containing tree.json")
+    qa_multi.add_argument("--output", required=True, help="Output directory")
+    qa_multi.add_argument("--concurrency", type=int, default=4)
+    qa_multi.add_argument("--limit", type=int, default=0)
+    qa_multi.add_argument("--tag", default=None)
+    qa_multi.add_argument("--resume", action="store_true")
+    qa_multi.add_argument("--debug", action="store_true", help="Store generated prompts")
+    qa_multi.set_defaults(_handler=_handle_financebench_qa_multidoc)
+
     evaluate = sub.add_parser(
         "financebench-evaluate",
         help="Evaluate FinanceBench results with OpenViking-compatible metrics",
@@ -494,11 +511,31 @@ def _load_tree(tree_path: Path) -> CCTree:
     return CCTree(root=_dict_to_node(root_data))
 
 
+def _financebench_doc_key(item: dict[str, Any]) -> str:
+    doc_name = str(item.get("doc_name") or "").strip()
+    pdf_id = str(item.get("pdf_id") or "").strip()
+    return doc_name or pdf_id
+
+
 def _parse_answer(raw: str) -> ParsedAnswer:
     text = (raw or "").strip()
     match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
     if match:
         text = match.group(1).strip()
+
+    def extract_string_field(field: str) -> str:
+        field_match = re.search(
+            rf'"{re.escape(field)}"\s*:\s*"((?:\\.|[^"\\])*)"',
+            text,
+            re.DOTALL,
+        )
+        if not field_match:
+            return ""
+        value = field_match.group(1)
+        try:
+            return json.loads(f'"{value}"').strip()
+        except Exception:
+            return value.strip()
 
     def coerce_list(value: Any) -> list[str]:
         if isinstance(value, list):
@@ -521,10 +558,12 @@ def _parse_answer(raw: str) -> ParsedAnswer:
             raw=raw,
         )
     except Exception:
+        fallback_answer = extract_string_field("answer")
+        fallback_reasoning = extract_string_field("reasoning")
         return ParsedAnswer(
             sufficient=True,
-            answer=(raw or "").strip(),
-            reasoning="",
+            answer=fallback_answer or (raw or "").strip(),
+            reasoning=fallback_reasoning,
             evidence_analysis=[],
             missing_info=[],
             raw=raw,
@@ -582,6 +621,22 @@ def _resolve_financebench_job(
     }
 
 
+def _collect_source_docs(result: Any) -> list[str]:
+    source_docs: set[str] = set()
+    for path in getattr(result, "text_map", {}).keys():
+        parts = str(path).split("--")
+        if len(parts) > 1 and parts[1]:
+            source_docs.add(parts[1])
+
+    for locs in getattr(result, "locations_by_path", {}).values():
+        for loc in locs:
+            file_name = getattr(loc, "file_name", None)
+            if file_name:
+                source_docs.add(str(file_name))
+
+    return sorted(source_docs)
+
+
 async def _run_financebench_qa_job(
     job: dict[str, Any],
     retriever: SemanticRetriever,
@@ -622,6 +677,132 @@ async def _run_financebench_qa_job(
             "retrieval": {
                 "latency_sec": latency,
                 "uris": list(result.text_map.keys()),
+            },
+            "llm": {
+                "final_answer": final_answer,
+                "raw_answer": raw_answer,
+                "sufficient": parsed.sufficient,
+                "reasoning": parsed.reasoning,
+                "evidence_analysis": parsed.evidence_analysis,
+                "missing_info": parsed.missing_info,
+            },
+            "metrics": {"Recall": recall},
+            "status": "success",
+        }
+        if debug:
+            output["debug_prompt"] = prompt
+
+        await asyncio.to_thread(
+            job["output_path"].write_text,
+            json.dumps(output, ensure_ascii=False, indent=2),
+            "utf-8",
+        )
+        return output
+
+
+def _load_financebench_multidoc_corpus(
+    dataset: list[dict[str, Any]],
+    dataset_path: Path,
+    cache_dir: Path,
+    logger: logging.Logger,
+) -> tuple[CCTree, dict[str, str], dict[str, str], list[dict[str, str]]]:
+    trees: dict[str, CCTree] = {}
+    source_paths: dict[str, str] = {}
+    pdf_id_to_doc_key: dict[str, str] = {}
+    corpus_docs: list[dict[str, str]] = []
+    seen_pdf_ids: set[str] = set()
+
+    for item in dataset:
+        pdf_id = str(item.get("pdf_id") or "").strip()
+        if not pdf_id or pdf_id in seen_pdf_ids:
+            continue
+        seen_pdf_ids.add(pdf_id)
+
+        base_key = _financebench_doc_key(item)
+        if not base_key:
+            continue
+
+        doc_key = base_key
+        if doc_key in trees:
+            doc_key = f"{base_key} [{pdf_id}]"
+
+        pdf_path = dataset_path.parent / pdf_id
+        tree_path = cache_dir / pdf_id.replace(".pdf", "") / "tree.json"
+        if not pdf_path.exists() or not tree_path.exists():
+            logger.warning(
+                "missing pdf or tree for FinanceBench multi-doc corpus",
+                extra={"pdf_id": pdf_id, "doc_key": doc_key},
+            )
+            continue
+
+        trees[doc_key] = _load_tree(tree_path)
+        source_paths[doc_key] = str(pdf_path)
+        pdf_id_to_doc_key[pdf_id] = doc_key
+        corpus_docs.append(
+            {
+                "doc_key": doc_key,
+                "doc_name": str(item.get("doc_name") or ""),
+                "pdf_id": pdf_id,
+                "pdf_path": str(pdf_path),
+                "tree_path": str(tree_path),
+            }
+        )
+
+    if not trees:
+        raise ValueError("No valid PDF/tree pairs found for multi-document corpus")
+
+    return CCTree.merge_multi_trees(trees), source_paths, pdf_id_to_doc_key, corpus_docs
+
+
+async def _run_financebench_qa_multidoc_job(
+    job: dict[str, Any],
+    retriever: SemanticRetriever,
+    llm: Any,
+    sem: asyncio.Semaphore,
+    debug: bool,
+    merged_tree: CCTree,
+    source_paths: dict[str, str],
+    pdf_id_to_doc_key: dict[str, str],
+) -> dict[str, Any]:
+    async with sem:
+        item = job["item"]
+        question = str(item.get("question") or "")
+        target_pdf_id = str(item.get("pdf_id") or "")
+        target_doc = pdf_id_to_doc_key.get(target_pdf_id, _financebench_doc_key(item))
+
+        t0 = time.monotonic()
+        result = await retriever.retrieve(merged_tree, question, source_paths)
+        latency = time.monotonic() - t0
+
+        context_blocks = list(result.text_map.values())
+        prompt = _build_financebench_prompt(question, context_blocks)
+        raw_answer = await llm.generate_text(prompt)
+        parsed = _parse_answer(raw_answer)
+        final_answer = parsed.answer.strip() or raw_answer.strip()
+
+        retrieved_docs = _retrieved_documents(result)
+        source_docs = _collect_source_docs(result)
+        recall = _check_recall(
+            [doc.get("content", "") for doc in retrieved_docs],
+            _coerce_string_list(item.get("evidence_texts")),
+        )
+        output = {
+            "questionId": item.get("questionId"),
+            "pdf_id": item.get("pdf_id"),
+            "doc_name": item.get("doc_name"),
+            "financebench_id": item.get("financebench_id"),
+            "question": question,
+            "ground_truth": item.get("answer"),
+            "answer": item.get("answer"),
+            "tag": item.get("tag"),
+            "prediction": final_answer,
+            "evidence": retrieved_docs,
+            "retrieval": {
+                "latency_sec": latency,
+                "uris": list(result.text_map.keys()),
+                "source_docs": source_docs,
+                "target_doc": target_doc,
+                "target_doc_hit": target_doc in source_docs,
             },
             "llm": {
                 "final_answer": final_answer,
@@ -731,6 +912,154 @@ async def _run_financebench_qa(args: argparse.Namespace, logger: logging.Logger)
 def _handle_financebench_qa(args: argparse.Namespace, logger: logging.Logger) -> int:
     try:
         return asyncio.run(_run_financebench_qa(args, logger))
+    finally:
+        shutdown_llm_local()
+
+
+async def _run_financebench_qa_multidoc(
+    args: argparse.Namespace, logger: logging.Logger
+) -> int:
+    config_path = (getattr(args, "config", None) or "").strip() or None
+    settings = Settings.load(config_path)
+    ensure_llm_local_loaded(settings, logger, config_path=config_path)
+
+    ui_settings = load_ui_settings_from_config(config_path)
+    qa_settings, _, qa_instance_id, cfg = settings_from_ui_payload(
+        settings, ui_settings, module_key="qaService"
+    )
+    retriever_settings, _, retriever_instance_id, _ = settings_from_ui_payload(
+        settings, cfg, module_key="retriever"
+    )
+    retriever_settings = replace(retriever_settings, enable_vector_search=False)
+
+    retriever = SemanticRetriever(retriever_settings, instance_id=retriever_instance_id)
+    llm = AsyncLLMFactory.create(qa_settings, instance_id=qa_instance_id)
+
+    dataset_path = Path(args.dataset).expanduser().resolve()
+    cache_dir = Path(args.cache).expanduser().resolve()
+    output_dir = Path(args.output).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
+    if not isinstance(dataset, list):
+        raise ValueError("FinanceBench dataset must be a JSON array")
+    if args.tag:
+        tags = {x.strip() for x in str(args.tag).split(",") if x.strip()}
+        dataset = [item for item in dataset if str(item.get("tag")) in tags]
+
+    (
+        merged_tree,
+        source_paths,
+        pdf_id_to_doc_key,
+        corpus_docs,
+    ) = await asyncio.to_thread(
+        _load_financebench_multidoc_corpus,
+        dataset,
+        dataset_path,
+        cache_dir,
+        logger,
+    )
+
+    run_dataset = dataset
+    if int(args.limit or 0) > 0:
+        run_dataset = run_dataset[: int(args.limit)]
+
+    completed: dict[Any, dict[str, Any]] = {}
+    result_path = output_dir / "result.json"
+    if args.resume and result_path.exists():
+        existing = json.loads(result_path.read_text(encoding="utf-8"))
+        existing_rows = existing.get("results", existing) if isinstance(existing, dict) else existing
+        if isinstance(existing_rows, list):
+            completed = {
+                row.get("questionId"): row
+                for row in existing_rows
+                if isinstance(row, dict) and row.get("status") == "success"
+            }
+
+    jobs = []
+    skipped_missing = 0
+    for item in run_dataset:
+        if item.get("questionId") in completed:
+            continue
+        pdf_id = str(item.get("pdf_id") or "")
+        if pdf_id not in pdf_id_to_doc_key:
+            skipped_missing += 1
+            logger.warning(
+                "missing target document in FinanceBench multi-doc corpus",
+                extra={"item": item},
+            )
+            continue
+        jobs.append(
+            {
+                "item": item,
+                "output_path": output_dir / f"qa_{item['questionId']}_result.json",
+            }
+        )
+
+    sem = asyncio.Semaphore(max(1, int(args.concurrency or 1)))
+    results = list(completed.values())
+    tasks = [
+        _run_financebench_qa_multidoc_job(
+            job,
+            retriever,
+            llm,
+            sem,
+            bool(args.debug),
+            merged_tree,
+            source_paths,
+            pdf_id_to_doc_key,
+        )
+        for job in jobs
+    ]
+    for task in tqdm(
+        asyncio.as_completed(tasks),
+        total=len(tasks),
+        desc="FinanceBench MultiDoc QA",
+    ):
+        try:
+            results.append(await task)
+        except Exception as e:
+            logger.exception("FinanceBench multi-doc QA failed", extra={"error": str(e)})
+
+    results.sort(key=lambda x: int(x.get("questionId", 0) or 0))
+    source_doc_hits = sum(
+        1
+        for row in results
+        if (row.get("retrieval") or {}).get("target_doc_hit") is True
+    )
+    non_empty_retrieval = sum(
+        1
+        for row in results
+        if len((row.get("retrieval") or {}).get("uris") or []) > 0
+    )
+    summary = {
+        "total": len(run_dataset),
+        "success": sum(1 for row in results if row.get("status") == "success"),
+        "skipped_missing_inputs": skipped_missing,
+        "semantic_only": True,
+        "multi_doc": True,
+        "corpus_docs": len(corpus_docs),
+        "source_doc_hits": source_doc_hits,
+        "non_empty_retrieval": non_empty_retrieval,
+        "prompt": "OpenViking FinanceBench evidence-audit JSON prompt",
+    }
+    result_path.write_text(
+        json.dumps(
+            {"metrics": summary, "corpus_docs": corpus_docs, "results": results},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(f"FinanceBench multi-doc QA results saved to {result_path}")
+    return 0 if summary["success"] == len(run_dataset) - skipped_missing else 2
+
+
+def _handle_financebench_qa_multidoc(
+    args: argparse.Namespace, logger: logging.Logger
+) -> int:
+    try:
+        return asyncio.run(_run_financebench_qa_multidoc(args, logger))
     finally:
         shutdown_llm_local()
 
