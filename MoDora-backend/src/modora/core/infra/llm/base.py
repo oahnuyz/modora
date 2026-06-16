@@ -164,7 +164,9 @@ class BaseAsyncLLMClient(ABC):
         res = await self._call_llm(prompt)
         return _bool_string(res)
 
-    async def check_node_mm(self, data: str, query: str, base64_image: str) -> bool:
+    async def check_node_mm(
+        self, data: str, query: str, base64_image: str | list[str]
+    ) -> bool:
         """Determine if the current multimodal node (text + image) is relevant to the query."""
         prompt = check_node_prompt2.format(data=data, query=query)
         res = await self._call_llm(prompt, base64_image)
@@ -226,7 +228,7 @@ class BaseAsyncLLMClient(ABC):
             raise ValueError(f"AI returned invalid JSON: {e}\nResponse: {response}")
 
     async def generate_annotation_async(
-        self, base64_image: str, cp_type: str, settings: Settings | None = None
+        self, base64_image: str | list[str], cp_type: str, settings: Settings | None = None
     ) -> Tuple[str, str, str]:
         """Asynchronously generate annotations (including title, metadata, and description)
         for images/charts/tables.

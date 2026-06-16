@@ -2,6 +2,7 @@ from .batch_qa import register as register_batch_qa
 from .build_tree import register as register_build_tree
 from .config import register as register_config
 from .evaluate import register as register_evaluate
+from .financebench import register as register_financebench
 from .health import register as register_health
 from .preprocess import register as register_preprocess
 from .cache_images import register as register_cache_images
@@ -12,6 +13,7 @@ __all__ = [
     "register_build_tree",
     "register_config",
     "register_evaluate",
+    "register_financebench",
     "register_health",
     "register_preprocess",
     "register_cache_images",

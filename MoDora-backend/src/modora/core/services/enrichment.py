@@ -51,9 +51,12 @@ class EnrichmentService:
             try:
                 # Capture component screenshot (IO operation, runs in thread pool)
                 loop = asyncio.get_running_loop()
-                base64_img = await loop.run_in_executor(
-                    None, self.media.crop_image, source, co
+                images = await loop.run_in_executor(
+                    None, self.media.crop_image, source, co.location
                 )
+                if not images:
+                    return None
+                base64_img = images[0] if len(images) == 1 else images
                 # Invoke LLM to generate annotations (Asynchronous)
                 title, metadata, data = await self.llm.generate_annotation_async(
                     base64_img, co.type

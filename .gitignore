@@ -4,6 +4,10 @@ __pycache__/
 *$py.class
 *.so
 
+#codex
+.codex/
+AGENTS.md
+
 # Environments
 venv/
 .venv/
@@ -26,6 +30,7 @@ wheels/
 *.egg
 .pip_tmp/
 MoDora-backend/.pip_tmp/
+.runtime/
 
 # MoDora Specific
 cache/
@@ -46,6 +51,9 @@ MoDora-backend/temp_*.json
 
 # Models & Data
 models/
+datasets/MMDA/
+datasets/financebench_raw/
+datasets/financebench_sample_*/
 *.pdf
 MoDora-backend/src/modora/lab/output/
 

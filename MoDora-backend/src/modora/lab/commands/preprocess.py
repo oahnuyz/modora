@@ -25,6 +25,14 @@ from modora.core.utils.pydantic import pydantic_dump, pydantic_validate
 from modora.core.utils.config import load_ui_settings_from_config
 
 
+def _safe_size(path: str) -> int | None:
+    """Return file size in bytes when available."""
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
+
+
 def _component_worker_wrapper(
     res_path: str, co_path: str, config_path: str | None
 ) -> tuple[int, int, float]:
@@ -51,16 +59,18 @@ def _component_worker_wrapper(
 
 
 def _ocr_worker_run(
-    pdf_path: str, config_path: str | None = None
-) -> tuple[dict[str, Any], int, float]:
+    pdf_path: str, config_path: str | None = None, pdf_id: int | None = None
+) -> tuple[dict[str, Any], int, int, bool, float]:
     """Worker function to execute OCR tasks.
 
     Args:
         pdf_path: Path to the PDF file.
         config_path: Path to the configuration file.
+        pdf_id: Optional dataset PDF id for logging.
 
     Returns:
-        A tuple containing (OCR payload, number of blocks, elapsed time).
+        A tuple containing (OCR payload, number of blocks, pages processed,
+        whether fallback was used, elapsed time).
     """
     t0 = time.monotonic()
     logger = logging.getLogger("modora.preprocess.ocr_worker")
@@ -76,20 +86,67 @@ def _ocr_worker_run(
     try:
         pdf_blocks: list[OCRBlock] = []
         source = f"file:{pdf_path}"
+        pages_processed = 0
+        logger.info(
+            "ocr predict started",
+            extra={
+                "task_name": "ocr",
+                "stage": "predict",
+                "pdf_id": pdf_id,
+                "pdf": pdf_path,
+            },
+        )
         for page_blocks in model.predict_iter(pdf_path):
             pdf_blocks.extend(page_blocks)
+            pages_processed += 1
+            if pages_processed == 1 or pages_processed % 10 == 0:
+                logger.info(
+                    "ocr page processed",
+                    extra={
+                        "task_name": "ocr",
+                        "stage": "predict",
+                        "pdf_id": pdf_id,
+                        "pdf": pdf_path,
+                        "pages_processed": pages_processed,
+                        "blocks_so_far": len(pdf_blocks),
+                        "elapsed_s": round(time.monotonic() - t0, 2),
+                    },
+                )
         ocr_res = OcrExtractResponse(source=source, blocks=pdf_blocks)
+        fallback_used = False
     except Exception as e:
         logger.warning(
             "ocr predict failed, using pdf text fallback",
-            extra={"task_name": "ocr", "pdf": pdf_path, "error": str(e)},
+            extra={
+                "task_name": "ocr",
+                "stage": "predict",
+                "pdf_id": pdf_id,
+                "pdf": pdf_path,
+                "error": str(e),
+            },
             exc_info=True,
         )
         ocr_res = extract_pdf_blocks(pdf_path)
+        pages_processed = 0
+        fallback_used = True
     payload = pydantic_dump(ocr_res)
     blocks = payload.get("blocks") if isinstance(payload, dict) else None
     n_blocks = len(blocks) if isinstance(blocks, list) else 0
-    return payload, n_blocks, time.monotonic() - t0
+    elapsed = time.monotonic() - t0
+    logger.info(
+        "ocr predict finished",
+        extra={
+            "task_name": "ocr",
+            "stage": "predict",
+            "pdf_id": pdf_id,
+            "pdf": pdf_path,
+            "pages_processed": pages_processed,
+            "blocks": n_blocks,
+            "fallback_used": fallback_used,
+            "elapsed_s": round(elapsed, 2),
+        },
+    )
+    return payload, n_blocks, pages_processed, fallback_used, elapsed
 
 
 async def _run_get_components(
@@ -256,16 +313,45 @@ class PreprocessPipeline:
         co_exists = os.path.isfile(job.co_path)
 
         if self.resume and res_exists and co_exists:
+            self.logger.info(
+                "preprocess job skipped",
+                extra={
+                    "task_name": "preprocess",
+                    "stage": "resume",
+                    "pdf_id": job.idx,
+                    "pdf": job.pdf_path,
+                    "res_path": job.res_path,
+                    "co_path": job.co_path,
+                },
+            )
             self._tick(is_skip=True)
             return False
 
         if not res_exists or not self.resume:
             try:
+                stage_t0 = time.monotonic()
+                self.logger.info(
+                    "ocr stage started",
+                    extra={
+                        "task_name": "ocr",
+                        "stage": "ocr",
+                        "pdf_id": job.idx,
+                        "pdf": job.pdf_path,
+                        "pdf_size_bytes": _safe_size(job.pdf_path),
+                        "res_path": job.res_path,
+                    },
+                )
                 loop = asyncio.get_running_loop()
                 # Run OCR directly in the main process (using thread pool)
                 # to avoid CUDA initialization issues with fork.
-                payload, _, _ = await loop.run_in_executor(
-                    None, _ocr_worker_run, job.pdf_path, self.config_path
+                payload, n_blocks, pages_processed, fallback_used, ocr_elapsed = (
+                    await loop.run_in_executor(
+                        None,
+                        _ocr_worker_run,
+                        job.pdf_path,
+                        self.config_path,
+                        job.idx,
+                    )
                 )
                 await loop.run_in_executor(
                     None,
@@ -274,11 +360,33 @@ class PreprocessPipeline:
                         encoding="utf-8",
                     ),
                 )
+                self.logger.info(
+                    "ocr stage finished",
+                    extra={
+                        "task_name": "ocr",
+                        "stage": "ocr",
+                        "pdf_id": job.idx,
+                        "pdf": job.pdf_path,
+                        "res_path": job.res_path,
+                        "res_size_bytes": _safe_size(job.res_path),
+                        "pages_processed": pages_processed,
+                        "blocks": n_blocks,
+                        "fallback_used": fallback_used,
+                        "ocr_elapsed_s": round(ocr_elapsed, 2),
+                        "elapsed_s": round(time.monotonic() - stage_t0, 2),
+                    },
+                )
                 return True
             except Exception as e:
                 self.logger.error(
                     "ocr failed",
-                    extra={"task_name": "ocr", "pdf": job.pdf_path, "error": str(e)},
+                    extra={
+                        "task_name": "ocr",
+                        "stage": "ocr",
+                        "pdf_id": job.idx,
+                        "pdf": job.pdf_path,
+                        "error": str(e),
+                    },
                     exc_info=True,
                 )
                 self._tick(is_fail=True)
@@ -289,6 +397,18 @@ class PreprocessPipeline:
                 return False
             finally:
                 pass
+        self.logger.info(
+            "ocr stage skipped",
+            extra={
+                "task_name": "ocr",
+                "stage": "resume",
+                "pdf_id": job.idx,
+                "pdf": job.pdf_path,
+                "res_path": job.res_path,
+                "co_path": job.co_path,
+                "reason": "res_exists",
+            },
+        )
         return True
 
     async def _submit_component_job(self, job: PreprocessJob, retry: int = 0):
@@ -300,6 +420,19 @@ class PreprocessPipeline:
         """
         await self.submit_sem.acquire()
         try:
+            self.logger.info(
+                "get_component stage started",
+                extra={
+                    "task_name": "get_component",
+                    "stage": "get_component",
+                    "pdf_id": job.idx,
+                    "pdf": job.pdf_path,
+                    "res_path": job.res_path,
+                    "res_size_bytes": _safe_size(job.res_path),
+                    "co_path": job.co_path,
+                    "retry": retry,
+                },
+            )
             loop = asyncio.get_running_loop()
             async with self.pool_lock:
                 if self.current_pool is None or getattr(
@@ -340,13 +473,29 @@ class PreprocessPipeline:
             return
         job = self.co_tasks.pop(t)
         try:
-            t.result()
+            blocks_n, body_n, elapsed = t.result()
+            self.logger.info(
+                "get_component stage finished",
+                extra={
+                    "task_name": "get_component",
+                    "stage": "get_component",
+                    "pdf_id": job.idx,
+                    "pdf": job.pdf_path,
+                    "blocks": blocks_n,
+                    "components": body_n,
+                    "co_path": job.co_path,
+                    "co_size_bytes": _safe_size(job.co_path),
+                    "elapsed_s": round(elapsed, 2),
+                },
+            )
             self._tick()
         except Exception as e:
             self.logger.error(
                 "get_component failed",
                 extra={
                     "task_name": "get_component",
+                    "stage": "get_component",
+                    "pdf_id": job.idx,
                     "pdf": job.pdf_path,
                     "error": str(e),
                 },
@@ -368,6 +517,19 @@ class PreprocessPipeline:
         if not jobs:
             self.logger.error("no pdf files found")
             return 2
+
+        self.logger.info(
+            "preprocess ocr pipeline started",
+            extra={
+                "task_name": "preprocess",
+                "dataset": str(getattr(self.args, "dataset", "") or ""),
+                "cache_dir": self.cache_dir,
+                "total": self.total,
+                "resume": self.resume,
+                "component_workers": self.component_workers,
+                "ocr_batch_size": getattr(self.args, "ocr_batch_size", None),
+            },
+        )
 
         self.pbar = tqdm(
             total=self.total, unit="pdf", dynamic_ncols=True, disable=False
