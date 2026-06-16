@@ -10,6 +10,8 @@ import re
 import shutil
 import string
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -60,6 +62,15 @@ FINANCEBENCH_QA_PROMPT = """Based on the financial document excerpts above, answ
 If the answer involves a numerical value, include the unit (e.g., USD millions, %, etc.).
 
 Question: {}"""
+
+
+DEFAULT_FINANCEBENCH_RAW_BASE = (
+    "https://raw.githubusercontent.com/patronus-ai/financebench/main"
+)
+DEFAULT_FINANCEBENCH_PDF_BASE_URL = f"{DEFAULT_FINANCEBENCH_RAW_BASE}/pdfs"
+DEFAULT_FINANCEBENCH_DOCUMENT_INFO_URL = (
+    f"{DEFAULT_FINANCEBENCH_RAW_BASE}/data/financebench_document_information.jsonl"
+)
 
 
 JUDGE_SYSTEM_PROMPT = """
@@ -156,6 +167,35 @@ def register(sub: argparse._SubParsersAction) -> None:
             "prepared dataset. Intended for small smoke tests."
         ),
     )
+    prepare.add_argument(
+        "--corpus-scope",
+        choices=["qa", "all-public-pdfs"],
+        default="qa",
+        help=(
+            "PDF corpus to prepare. 'qa' includes only selected QA documents; "
+            "'all-public-pdfs' includes all documents listed in document info."
+        ),
+    )
+    prepare.add_argument(
+        "--document-info",
+        default=None,
+        help="Path to financebench_document_information.jsonl",
+    )
+    prepare.add_argument(
+        "--download-missing-pdfs",
+        action="store_true",
+        help="Download missing FinanceBench PDFs/document-info into the prepared dataset",
+    )
+    prepare.add_argument(
+        "--pdf-base-url",
+        default=DEFAULT_FINANCEBENCH_PDF_BASE_URL,
+        help="Base URL used with --download-missing-pdfs for <doc_name>.pdf",
+    )
+    prepare.add_argument(
+        "--document-info-url",
+        default=DEFAULT_FINANCEBENCH_DOCUMENT_INFO_URL,
+        help="URL used to download financebench_document_information.jsonl",
+    )
     prepare.set_defaults(_handler=_handle_financebench_prepare)
 
     qa = sub.add_parser(
@@ -187,6 +227,16 @@ def register(sub: argparse._SubParsersAction) -> None:
     qa_multi.add_argument("--tag", default=None)
     qa_multi.add_argument("--resume", action="store_true")
     qa_multi.add_argument("--debug", action="store_true", help="Store generated prompts")
+    qa_multi.add_argument(
+        "--corpus-manifest",
+        default=None,
+        help="Path to corpus.json. Defaults to <dataset dir>/corpus.json when present.",
+    )
+    qa_multi.add_argument(
+        "--allow-missing-corpus",
+        action="store_true",
+        help="Skip corpus documents with missing PDF/tree files instead of failing.",
+    )
     qa_multi.set_defaults(_handler=_handle_financebench_qa_multidoc)
 
     evaluate = sub.add_parser(
@@ -224,7 +274,133 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def _resolve_financebench_paths(source: Path, pdf_dir: str | None) -> tuple[Path, Path]:
+def _ordered_unique(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
+def _download_url_to_path(url: str, path: Path, logger: logging.Logger) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.download")
+    if tmp.exists():
+        tmp.unlink()
+
+    logger.info("downloading FinanceBench artifact", extra={"url": url, "path": str(path)})
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "MoDora-FinanceBench/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        with tmp.open("wb") as f:
+            shutil.copyfileobj(response, f)
+    tmp.replace(path)
+
+
+def _financebench_pdf_url(base_url: str, doc_name: str) -> str:
+    pdf_name = f"{doc_name}.pdf"
+    quoted_doc_name = urllib.parse.quote(doc_name, safe="")
+    quoted_pdf_name = urllib.parse.quote(pdf_name, safe="")
+    if "{pdf_name}" in base_url or "{doc_name}" in base_url:
+        return base_url.format(doc_name=quoted_doc_name, pdf_name=quoted_pdf_name)
+    return f"{base_url.rstrip('/')}/{quoted_pdf_name}"
+
+
+def _doc_name_from_document_info(row: dict[str, Any]) -> str:
+    for key in (
+        "doc_name",
+        "document_name",
+        "document_id",
+        "pdf_name",
+        "file_name",
+        "filename",
+        "name",
+    ):
+        value = str(row.get(key) or "").strip()
+        if not value:
+            continue
+        if value.lower().endswith(".pdf"):
+            value = Path(value).stem
+        return value
+    return ""
+
+
+def _load_document_info_rows(
+    *,
+    document_info: str | None,
+    output_dir: Path,
+    download_missing: bool,
+    document_info_url: str,
+    logger: logging.Logger,
+) -> list[dict[str, Any]]:
+    path: Path | None = None
+    explicit_path = bool(document_info)
+    if document_info:
+        path = Path(document_info).expanduser().resolve()
+    else:
+        candidate = output_dir / "financebench_document_information.jsonl"
+        if candidate.exists():
+            path = candidate
+
+    if path is None or not path.exists():
+        if explicit_path and not download_missing:
+            raise FileNotFoundError(f"FinanceBench document-info not found: {path}")
+        if not download_missing:
+            return []
+        path = path or output_dir / "financebench_document_information.jsonl"
+        _download_url_to_path(document_info_url, path, logger)
+
+    rows = _load_jsonl(path)
+    return [row for row in rows if _doc_name_from_document_info(row)]
+
+
+def _document_info_map(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    mapping: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        doc_name = _doc_name_from_document_info(row)
+        if doc_name and doc_name not in mapping:
+            mapping[doc_name] = row
+    return mapping
+
+
+def _qa_doc_metadata(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    metadata: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        doc_name = str(row.get("doc_name") or "").strip()
+        if not doc_name or doc_name in metadata:
+            continue
+        metadata[doc_name] = {
+            "company": row.get("company"),
+            "dataset_subset_label": row.get("dataset_subset_label"),
+        }
+    return metadata
+
+
+def _document_download_url(
+    doc_name: str,
+    doc_info: dict[str, Any] | None,
+    pdf_base_url: str,
+) -> str:
+    if doc_info:
+        for key in ("pdf_url", "pdf_link", "download_url"):
+            value = str(doc_info.get(key) or "").strip()
+            if value.startswith(("http://", "https://")):
+                return value
+    return _financebench_pdf_url(pdf_base_url, doc_name)
+
+
+def _resolve_financebench_paths(
+    source: Path,
+    pdf_dir: str | None,
+    *,
+    allow_missing_pdf_dir: bool = False,
+) -> tuple[Path, Path]:
     if source.is_file():
         jsonl_path = source
         base_dir = source.parent
@@ -248,7 +424,7 @@ def _resolve_financebench_paths(source: Path, pdf_dir: str | None) -> tuple[Path
         candidates = [base_dir / "pdfs", jsonl_path.parent / "pdfs", jsonl_path.parent.parent / "pdfs"]
         resolved_pdf_dir = next((p for p in candidates if p.exists()), candidates[0])
 
-    if not resolved_pdf_dir.exists():
+    if not resolved_pdf_dir.exists() and not allow_missing_pdf_dir:
         raise FileNotFoundError(f"FinanceBench PDF directory not found: {resolved_pdf_dir}")
     return jsonl_path.resolve(), resolved_pdf_dir.resolve()
 
@@ -382,14 +558,71 @@ def _copy_or_truncate_pdf(src: Path, dst: Path, max_pages: int) -> dict[str, Any
     }
 
 
+def _truncate_pdf_in_place(path: Path, max_pages: int) -> dict[str, Any]:
+    if max_pages <= 0:
+        return {
+            "source_pages": None,
+            "output_pages": None,
+            "truncated": False,
+        }
+
+    import fitz
+
+    tmp = path.with_name(f"{path.name}.tmp")
+    if tmp.exists():
+        tmp.unlink()
+
+    with fitz.open(path) as in_doc:
+        source_pages = int(in_doc.page_count)
+        output_pages = min(max_pages, source_pages)
+        if output_pages >= source_pages:
+            return {
+                "source_pages": source_pages,
+                "output_pages": source_pages,
+                "truncated": False,
+            }
+        with fitz.open() as out_doc:
+            if output_pages > 0:
+                out_doc.insert_pdf(in_doc, from_page=0, to_page=output_pages - 1)
+            out_doc.save(tmp)
+
+    tmp.replace(path)
+    return {
+        "source_pages": source_pages,
+        "output_pages": output_pages,
+        "truncated": True,
+    }
+
+
 def _handle_financebench_prepare(args: argparse.Namespace, logger: logging.Logger) -> int:
     try:
         source = Path(args.source).expanduser().resolve()
-        jsonl_path, pdf_dir = _resolve_financebench_paths(source, args.pdf_dir)
+        jsonl_path, pdf_dir = _resolve_financebench_paths(
+            source,
+            args.pdf_dir,
+            allow_missing_pdf_dir=bool(args.download_missing_pdfs),
+        )
         output_dir = Path(args.output).expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
 
         rows = _load_jsonl(jsonl_path)
+        document_info_rows: list[dict[str, Any]] = []
+        if args.corpus_scope == "all-public-pdfs" or args.document_info:
+            document_info_rows = _load_document_info_rows(
+                document_info=args.document_info,
+                output_dir=output_dir,
+                download_missing=bool(args.download_missing_pdfs),
+                document_info_url=str(args.document_info_url),
+                logger=logger,
+            )
+            if document_info_rows:
+                _write_jsonl(
+                    output_dir / "financebench_document_information.jsonl",
+                    document_info_rows,
+                )
+        document_info_by_doc = _document_info_map(document_info_rows)
+        qa_metadata_by_doc = _qa_doc_metadata(rows)
+
         sample_size_arg = int(args.sample_size)
         num_docs_arg = int(args.num_docs)
         sample_size = None if args.full or sample_size_arg <= 0 else sample_size_arg
@@ -405,20 +638,100 @@ def _handle_financebench_prepare(args: argparse.Namespace, logger: logging.Logge
         if max_pages_per_pdf < 0:
             raise ValueError("--max-pages-per-pdf must be >= 0")
 
+        if args.corpus_scope == "all-public-pdfs":
+            corpus_doc_names = list(document_info_by_doc.keys())
+            if not corpus_doc_names and pdf_dir.exists():
+                corpus_doc_names = sorted(
+                    p.stem for p in pdf_dir.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"
+                )
+                if corpus_doc_names:
+                    logger.warning(
+                        "document-info unavailable; using local PDF directory as corpus",
+                        extra={"pdf_dir": str(pdf_dir), "pdfs": len(corpus_doc_names)},
+                    )
+            if not corpus_doc_names:
+                raise FileNotFoundError(
+                    "No FinanceBench corpus documents found. Provide --document-info, "
+                    "use --download-missing-pdfs, or point --pdf-dir at local PDFs."
+                )
+            corpus_doc_names = _ordered_unique(corpus_doc_names + selected_docs)
+        else:
+            corpus_doc_names = list(selected_docs)
+
         doc_to_pdf_id = {
-            doc_name: f"{idx}.pdf" for idx, doc_name in enumerate(selected_docs, start=1)
+            doc_name: f"{idx}.pdf" for idx, doc_name in enumerate(corpus_doc_names, start=1)
         }
+        selected_doc_set = set(selected_docs)
         missing_pdfs: list[str] = []
         pdf_page_info: dict[str, Any] = {}
+        corpus_documents: list[dict[str, Any]] = []
+        downloaded_pdfs = 0
         for doc_name, pdf_id in doc_to_pdf_id.items():
             src = pdf_dir / f"{doc_name}.pdf"
-            if not src.exists():
-                missing_pdfs.append(str(src))
+            dst = output_dir / pdf_id
+            doc_info = document_info_by_doc.get(doc_name, {})
+            download_url = _document_download_url(
+                doc_name,
+                doc_info,
+                str(args.pdf_base_url),
+            )
+            source_type = "local"
+            try:
+                if src.exists():
+                    pdf_info = _copy_or_truncate_pdf(src, dst, max_pages_per_pdf)
+                    pdf_info["downloaded"] = False
+                elif args.download_missing_pdfs:
+                    _download_url_to_path(download_url, dst, logger)
+                    truncate_info = _truncate_pdf_in_place(dst, max_pages_per_pdf)
+                    pdf_info = {
+                        "source": download_url,
+                        "output": str(dst),
+                        "downloaded": True,
+                        **truncate_info,
+                    }
+                    source_type = "downloaded"
+                    downloaded_pdfs += 1
+                else:
+                    missing_pdfs.append(str(src))
+                    continue
+            except Exception as e:
+                logger.exception(
+                    "failed to prepare FinanceBench PDF",
+                    extra={"doc_name": doc_name, "pdf_id": pdf_id, "error": str(e)},
+                )
+                missing_pdfs.append(f"{doc_name}: {e}")
                 continue
+
             pdf_page_info[pdf_id] = {
                 "doc_name": doc_name,
-                **_copy_or_truncate_pdf(src, output_dir / pdf_id, max_pages_per_pdf),
+                "source_type": source_type,
+                "download_url": download_url,
+                **pdf_info,
             }
+            qa_meta = qa_metadata_by_doc.get(doc_name, {})
+            corpus_documents.append(
+                {
+                    "doc_name": doc_name,
+                    "pdf_id": pdf_id,
+                    "pdf_path": pdf_id,
+                    "is_qa_target": doc_name in selected_doc_set,
+                    "company": doc_info.get("company") or qa_meta.get("company"),
+                    "doc_type": (
+                        doc_info.get("doc_type")
+                        or doc_info.get("filing_type")
+                        or doc_info.get("form_type")
+                    ),
+                    "doc_period": (
+                        doc_info.get("doc_period")
+                        or doc_info.get("fiscal_year")
+                        or doc_info.get("year")
+                    ),
+                    "dataset_subset_label": qa_meta.get("dataset_subset_label"),
+                    "download_url": download_url,
+                    "source_type": source_type,
+                    "document_info": doc_info,
+                }
+            )
 
         if missing_pdfs:
             logger.error("missing FinanceBench PDFs", extra={"missing": missing_pdfs})
@@ -450,10 +763,35 @@ def _handle_financebench_prepare(args: argparse.Namespace, logger: logging.Logge
         )
         _write_jsonl(output_dir / "financebench_open_source.jsonl", selected_rows)
 
+        corpus_manifest = {
+            "schema_version": 1,
+            "dataset": "FinanceBench",
+            "corpus_scope": str(args.corpus_scope),
+            "source_jsonl": str(jsonl_path),
+            "source_pdf_dir": str(pdf_dir),
+            "document_info": (
+                str(Path(args.document_info).expanduser().resolve())
+                if args.document_info
+                else (
+                    str(output_dir / "financebench_document_information.jsonl")
+                    if document_info_rows
+                    else None
+                )
+            ),
+            "total_documents": len(corpus_documents),
+            "qa_target_documents": len(selected_doc_set),
+            "documents": corpus_documents,
+        }
+        (output_dir / "corpus.json").write_text(
+            json.dumps(corpus_manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
         mapping = {
             "doc_to_pdf_id": doc_to_pdf_id,
             "pdf_id_to_doc": {v: k for k, v in doc_to_pdf_id.items()},
             "pdf_page_info": pdf_page_info,
+            "corpus_manifest": "corpus.json",
         }
         (output_dir / "doc_mapping.json").write_text(
             json.dumps(mapping, ensure_ascii=False, indent=2),
@@ -469,12 +807,17 @@ def _handle_financebench_prepare(args: argparse.Namespace, logger: logging.Logge
             "original_num_docs": len(_group_by_doc(rows)),
             "sampled_total_qas": len(selected_rows),
             "sampled_num_docs": len(selected_docs),
+            "corpus_scope": str(args.corpus_scope),
+            "corpus_num_docs": len(corpus_documents),
             "sample_size": sample_size,
             "num_docs": num_docs,
             "seed": int(args.seed),
             "sample_mode": str(args.sample_mode),
             "is_full": bool(args.full),
             "max_pages_per_pdf": max_pages_per_pdf or None,
+            "download_missing_pdfs": bool(args.download_missing_pdfs),
+            "downloaded_pdfs": downloaded_pdfs,
+            "document_info_rows": len(document_info_rows),
         }
         (output_dir / "sampling_metadata.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2),
@@ -482,7 +825,12 @@ def _handle_financebench_prepare(args: argparse.Namespace, logger: logging.Logge
         )
 
         print(f"Prepared FinanceBench dataset -> {output_dir}")
-        print(f"QAs: {len(selected_rows)}, PDFs: {len(selected_docs)}")
+        print(
+            f"QAs: {len(selected_rows)}, QA PDFs: {len(selected_docs)}, "
+            f"corpus PDFs: {len(corpus_documents)}"
+        )
+        if downloaded_pdfs:
+            print(f"Downloaded PDFs: {downloaded_pdfs}")
         if max_pages_per_pdf > 0:
             print(f"PDF page limit: first {max_pages_per_pdf} pages per PDF")
         return 0
@@ -700,52 +1048,127 @@ async def _run_financebench_qa_job(
         return output
 
 
-def _load_financebench_multidoc_corpus(
-    dataset: list[dict[str, Any]],
+def _resolve_corpus_pdf_path(
+    doc: dict[str, Any],
     dataset_path: Path,
-    cache_dir: Path,
-    logger: logging.Logger,
-) -> tuple[CCTree, dict[str, str], dict[str, str], list[dict[str, str]]]:
-    trees: dict[str, CCTree] = {}
-    source_paths: dict[str, str] = {}
-    pdf_id_to_doc_key: dict[str, str] = {}
-    corpus_docs: list[dict[str, str]] = []
-    seen_pdf_ids: set[str] = set()
+    corpus_manifest_path: Path | None,
+) -> Path:
+    value = str(doc.get("pdf_path") or doc.get("path") or doc.get("pdf_id") or "").strip()
+    if not value:
+        value = str(doc.get("pdf_id") or "").strip()
 
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+
+    candidates: list[Path] = []
+    if corpus_manifest_path is not None:
+        candidates.append(corpus_manifest_path.parent / path)
+    candidates.append(dataset_path.parent / path)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def _dataset_corpus_documents(dataset: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    docs: list[dict[str, Any]] = []
+    seen_pdf_ids: set[str] = set()
     for item in dataset:
         pdf_id = str(item.get("pdf_id") or "").strip()
         if not pdf_id or pdf_id in seen_pdf_ids:
             continue
         seen_pdf_ids.add(pdf_id)
+        docs.append(
+            {
+                "doc_name": str(item.get("doc_name") or "").strip(),
+                "pdf_id": pdf_id,
+                "pdf_path": pdf_id,
+            }
+        )
+    return docs
 
-        base_key = _financebench_doc_key(item)
-        if not base_key:
+
+def _load_corpus_documents(
+    dataset: list[dict[str, Any]],
+    corpus_manifest_path: Path | None,
+) -> list[dict[str, Any]]:
+    if corpus_manifest_path is None:
+        return _dataset_corpus_documents(dataset)
+
+    payload = json.loads(corpus_manifest_path.read_text(encoding="utf-8"))
+    documents = payload.get("documents") if isinstance(payload, dict) else None
+    if not isinstance(documents, list):
+        raise ValueError(f"Invalid FinanceBench corpus manifest: {corpus_manifest_path}")
+    return [doc for doc in documents if isinstance(doc, dict)]
+
+
+def _load_financebench_multidoc_corpus(
+    dataset: list[dict[str, Any]],
+    dataset_path: Path,
+    cache_dir: Path,
+    logger: logging.Logger,
+    corpus_manifest_path: Path | None,
+    allow_missing_corpus: bool,
+) -> tuple[CCTree, dict[str, str], dict[str, str], list[dict[str, Any]]]:
+    trees: dict[str, CCTree] = {}
+    source_paths: dict[str, str] = {}
+    pdf_id_to_doc_key: dict[str, str] = {}
+    corpus_docs: list[dict[str, Any]] = []
+    seen_pdf_ids: set[str] = set()
+    missing_inputs: list[dict[str, str]] = []
+
+    for doc in _load_corpus_documents(dataset, corpus_manifest_path):
+        pdf_id = str(doc.get("pdf_id") or "").strip()
+        if not pdf_id or pdf_id in seen_pdf_ids:
             continue
+        seen_pdf_ids.add(pdf_id)
+
+        base_key = str(doc.get("doc_name") or "").strip() or pdf_id
 
         doc_key = base_key
         if doc_key in trees:
             doc_key = f"{base_key} [{pdf_id}]"
 
-        pdf_path = dataset_path.parent / pdf_id
+        pdf_path = _resolve_corpus_pdf_path(doc, dataset_path, corpus_manifest_path)
         tree_path = cache_dir / pdf_id.replace(".pdf", "") / "tree.json"
         if not pdf_path.exists() or not tree_path.exists():
-            logger.warning(
-                "missing pdf or tree for FinanceBench multi-doc corpus",
-                extra={"pdf_id": pdf_id, "doc_key": doc_key},
+            missing_inputs.append(
+                {
+                    "pdf_id": pdf_id,
+                    "doc_key": doc_key,
+                    "pdf_path": str(pdf_path),
+                    "tree_path": str(tree_path),
+                }
             )
             continue
 
         trees[doc_key] = _load_tree(tree_path)
         source_paths[doc_key] = str(pdf_path)
         pdf_id_to_doc_key[pdf_id] = doc_key
-        corpus_docs.append(
+        loaded_doc = dict(doc)
+        loaded_doc.update(
             {
                 "doc_key": doc_key,
-                "doc_name": str(item.get("doc_name") or ""),
+                "doc_name": str(doc.get("doc_name") or ""),
                 "pdf_id": pdf_id,
                 "pdf_path": str(pdf_path),
                 "tree_path": str(tree_path),
             }
+        )
+        corpus_docs.append(loaded_doc)
+
+    if missing_inputs and not allow_missing_corpus:
+        preview = missing_inputs[:10]
+        raise FileNotFoundError(
+            "Missing FinanceBench corpus PDF/tree inputs: "
+            f"{json.dumps(preview, ensure_ascii=False)}"
+        )
+    if missing_inputs:
+        logger.warning(
+            "skipped missing FinanceBench corpus inputs",
+            extra={"missing_count": len(missing_inputs), "missing_preview": missing_inputs[:10]},
         )
 
     if not trees:
@@ -947,6 +1370,13 @@ async def _run_financebench_qa_multidoc(
         tags = {x.strip() for x in str(args.tag).split(",") if x.strip()}
         dataset = [item for item in dataset if str(item.get("tag")) in tags]
 
+    manifest_arg = str(getattr(args, "corpus_manifest", "") or "").strip()
+    if manifest_arg:
+        corpus_manifest_path: Path | None = Path(manifest_arg).expanduser().resolve()
+    else:
+        default_manifest = dataset_path.parent / "corpus.json"
+        corpus_manifest_path = default_manifest if default_manifest.exists() else None
+
     (
         merged_tree,
         source_paths,
@@ -958,6 +1388,8 @@ async def _run_financebench_qa_multidoc(
         dataset_path,
         cache_dir,
         logger,
+        corpus_manifest_path,
+        bool(getattr(args, "allow_missing_corpus", False)),
     )
 
     run_dataset = dataset
@@ -1039,6 +1471,7 @@ async def _run_financebench_qa_multidoc(
         "semantic_only": True,
         "multi_doc": True,
         "corpus_docs": len(corpus_docs),
+        "corpus_manifest": str(corpus_manifest_path) if corpus_manifest_path else None,
         "source_doc_hits": source_doc_hits,
         "non_empty_retrieval": non_empty_retrieval,
         "prompt": "OpenViking FinanceBench evidence-audit JSON prompt",
